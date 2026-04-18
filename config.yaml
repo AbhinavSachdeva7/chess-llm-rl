@@ -1,0 +1,35 @@
+# chess-llm-rl single config
+model:
+  name: unsloth/gemma-4-E2B-it
+  max_seq_length: 2048
+grpo:
+  num_generations: 4
+  max_completion_length: 64          # thinking in hidden channel; visible = <move>SAN</move> only
+  per_device_train_batch_size: 4
+  learning_rate: 1.0e-6
+  beta: 0.0                           # no KL penalty
+  temperature: 1.0
+  use_vllm: false                     # no vLLM on T4
+stockfish:
+  path: ./stockfish/stockfish
+  analyst_time: 0.1
+  opponent_time: 0.1
+curriculum:
+  start_elo: 400
+  step: 200
+  win_rate_threshold: 0.6
+  min_games_at_level: 20
+  window: 30
+game:
+  max_moves: 200
+  pgn_max_tokens: 512
+training:
+  arm: fen_pgn                        # or fen_only
+  games_per_iteration: 10
+  checkpoint_every: 50
+  seed: 42
+wandb:
+  project: chess-llm-rl
+  mode: online                        # offline for local CPU
+paths:
+  checkpoints: ./checkpoints

@@ -1,0 +1,11 @@
+python-chess>=1.11
+torch>=2.1
+transformers>=4.45
+trl>=0.16
+peft
+bitsandbytes
+wandb
+pydantic>=2.0
+pyyaml
+datasets
+pytest

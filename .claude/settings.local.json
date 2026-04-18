@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:unsloth.ai)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import chess_rl\")",
+      "Bash(python -c \"import chess; print\\('chess ok'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -c \"import chess; import chess.engine; print\\('ok'\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
