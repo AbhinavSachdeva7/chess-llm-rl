@@ -61,3 +61,10 @@ stockfish*
 # OS
 .DS_Store
 Thumbs.db
+
+# inspiration
+inspiration/
+
+unsloth-docs/
+memory/
+.mcp.json
