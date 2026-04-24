@@ -54,10 +54,8 @@ def build_messages(
     color_str = "White" if llm_color else "Black"
     instructions = (
         f"You are a chess engine playing as {color_str}. "
-        "Choose the best legal move and respond with ONLY the move in this exact format: "
-        "<move>SAN</move>. Example: <move>Nf3</move>. "
-        "Think as much as you want before answering."
-        "Do not include any opponent move justifications, your move justifications, long reasonings, explanations, and analysis in your answer."
+        "Think step by step inside <think>...</think>, then respond with your move in <move>SAN</move>. "
+        "Example: <think>The queen is attacked.</think><move>Nf3</move>."
     )
 
     fen = board.fen()
@@ -99,5 +97,5 @@ def apply_template(tok, messages: list[dict]) -> str:
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False,
+        enable_thinking=True,
     )

@@ -1,16 +1,14 @@
 """
-rewards.py — Three reward functions for chess move quality assessment.
+rewards.py — Four reward functions for chess move quality assessment.
 
-R1  reward_format(response)          -> float   syntax/format check
-R2  reward_legality(response, board) -> float   legality via python-chess
-R3  reward_strategic(response, board, analyst) -> float   centipawn diff (DIFF-ONLY, no +C)
+R1  reward_format(response)                         -> float          think+move tag check
+R2  reward_legality(response, board)                -> float          legality via python-chess
+R3  reward_strategic(response, board, analyst)      -> Optional[float] centipawn delta (None=unparseable)
+R4  reward_optimal(delta)                           -> float          +1.0 bonus when delta > -0.1
 
-compute_reward chains all three with early-exit on failure.
+compute_reward evaluates all four with NO early exits. Total = R1 + R2 + (R3 or 0.0) + R4.
 
 Module-level analyst singleton (lazy-init, atexit close) is exposed via get_analyst().
-Callers (S3, S9) that already hold a chess.engine.SimpleEngine can pass it directly to
-reward_strategic / compute_reward; get_analyst() is provided for callers that need the
-module-managed singleton.
 """
 
 import atexit
@@ -35,7 +33,6 @@ def _find_stockfish_binary() -> Path:
     """
     Locate Stockfish binary.
     Prefer ./stockfish/stockfish.exe (Windows) or ./stockfish/stockfish (Linux/Mac).
-    Mirrors the logic in stockfish.py so this module works standalone.
     """
     base = Path("./stockfish")
     if sys.platform == "win32" or os.name == "nt":
@@ -73,10 +70,7 @@ def _close_analyst() -> None:
 
 
 def _get_analyst() -> chess.engine.SimpleEngine:
-    """
-    Lazy-initialise the module-level Stockfish analyst engine.
-    Registers an atexit handler on first call.
-    """
+    """Lazy-initialise the module-level Stockfish analyst engine."""
     global _analyst, _atexit_registered
     if _analyst is None:
         binary = _find_stockfish_binary()
@@ -90,23 +84,22 @@ def _get_analyst() -> chess.engine.SimpleEngine:
 def get_analyst() -> chess.engine.SimpleEngine:
     """
     Public accessor for the module-level Stockfish analyst singleton.
-    Used by S3, S9, and any other caller that needs a ready engine without
-    constructing a full StockfishManager.
+    Used by train.py and any other caller that needs a ready engine.
     """
     return _get_analyst()
 
 
 # ---------------------------------------------------------------------------
-# R1 — Format / syntax reward
+# Shared regex patterns
 # ---------------------------------------------------------------------------
 
-# SAN regex: optionally piece letter, optionally source file/rank, optional capture,
-# destination square, optional promotion, optional check/mate marker.
-# Also handles pawn promotions like a8=Q+, b1=R#, exd8=Q, etc.
+_MOVE_TAG    = re.compile(r'<move>(.*?)</move>', re.IGNORECASE)
+_THINK_START = re.compile(r'<think>',            re.IGNORECASE)
+_THINK_END   = re.compile(r'</think>',           re.IGNORECASE)
+
 _SAN_PATTERN = re.compile(
     r'[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](=[QRBN])?[+#]?'
 )
-_MOVE_TAG = re.compile(r'<move>(.*?)</move>', re.IGNORECASE)
 
 
 def extract_san(response: str) -> str:
@@ -117,24 +110,41 @@ def extract_san(response: str) -> str:
     return response.strip().rstrip(".")
 
 
+# ---------------------------------------------------------------------------
+# R1 — Format reward
+# ---------------------------------------------------------------------------
+
 def reward_format(response: str) -> float:
     """
-    R1: Check that the response contains a <move>SAN</move> tag with valid SAN.
+    R1: Validate <think>...</think><move>SAN</move> structure.
+
+    All four conditions must pass:
+      1. <think> is present
+      2. </think> is present
+      3. <move>SAN</move> is present with valid SAN content
+      4. Tag order: <think> < </think> < <move>
 
     Returns:
-        +0.1  if <move> tag present and content is valid SAN or castling.
-        -1.0  otherwise (no tag, empty tag, non-SAN content).
+        +0.2  all conditions satisfied
+        -1.0  any condition fails
     """
-    if not _MOVE_TAG.search(response):
+    think_start_m = _THINK_START.search(response)
+    think_end_m   = _THINK_END.search(response)
+    move_m        = _MOVE_TAG.search(response)
+
+    if not think_start_m or not think_end_m or not move_m:
         return -1.0
 
-    san = extract_san(response)
+    # Tag order: <think> must appear before </think>, which must appear before <move>
+    if not (think_start_m.start() < think_end_m.start() < move_m.start()):
+        return -1.0
 
+    san = move_m.group(1).strip().rstrip(".")
     if san in ("O-O", "O-O-O"):
-        return 0.1
+        return 0.2
 
     if re.fullmatch(r'[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](=[QRBN])?[+#]?', san):
-        return 0.1
+        return 0.2
 
     return -1.0
 
@@ -145,16 +155,16 @@ def reward_format(response: str) -> float:
 
 def reward_legality(response: str, board: chess.Board) -> float:
     """
-    R2: Check that the response is a legal move in the given position.
+    R2: Check that the extracted move is legal in the given position.
 
     Returns:
-        +0.5  if the move parses and is in board.legal_moves.
-        -5.0  if parsing fails or the move is illegal.
+        +0.5  move parses and is in board.legal_moves
+        -5.0  parsing fails or move is illegal
     """
-    response = extract_san(response).rstrip(".")
+    san = extract_san(response).rstrip(".")
 
     try:
-        move = board.parse_san(response)
+        move = board.parse_san(san)
         if move in board.legal_moves:
             return 0.5
         return -5.0
@@ -168,32 +178,36 @@ def reward_legality(response: str, board: chess.Board) -> float:
 
 
 # ---------------------------------------------------------------------------
-# R3 — Strategic reward (DIFF-ONLY, no additive constant)
+# R3 — Strategic reward
 # ---------------------------------------------------------------------------
 
 def reward_strategic(
     response: str,
     board: chess.Board,
     analyst: chess.engine.SimpleEngine,
-) -> float:
+) -> Optional[float]:
     """
-    R3: Pure centipawn-difference reward (no additive constant).
+    R3: Centipawn-difference reward relative to Stockfish best.
 
     Algorithm:
-      1. Evaluate the CURRENT board with Stockfish; score relative to the side to
-         move → best_score (centipawns, mover's POV).
-      2. Parse the LLM's move and push it onto a COPY of the board.
-      3. Evaluate the post-move board; the perspective has flipped to the opponent,
-         so we negate → model_score (back to mover's POV).
-      4. delta = (model_score - best_score) / 100.0
-         Clamped to [-10.0, 0.0]: best move ≈ 0, worse moves go negative.
+      1. Parse the LLM's move — return None immediately if it fails.
+      2. Evaluate current board → best_score (mover POV, centipawns).
+      3. Push LLM move onto a copy; evaluate post-move → negate → model_score.
+      4. delta = (model_score - best_score) / 100, clamped to [-10.0, 0.0].
 
     Returns:
-        A float in [-10.0, 0.0].
-        Returns 0.0 without penalty if the move cannot be parsed (R2 already
-        penalises illegality; compute_reward gates R3 on R2 success anyway).
+        float in [-10.0, 0.0]  move parses and Stockfish evaluates successfully.
+        None                   move cannot be parsed (R2 already penalises this;
+                               returning None prevents reward_optimal from firing spuriously).
     """
-    response = extract_san(response).rstrip(".")
+    san = extract_san(response).rstrip(".")
+
+    # Validate parse before touching Stockfish
+    try:
+        board_copy = board.copy()
+        move = board_copy.parse_san(san)
+    except Exception:
+        return None
 
     try:
         # Step 1: evaluate current position (mover's POV)
@@ -201,28 +215,43 @@ def reward_strategic(
         best_score = info_pre["score"].relative.score(mate_score=10000)
         assert best_score is not None
 
-        # Step 2: push LLM move onto a copy
-        board_copy = board.copy()
-        move = board_copy.parse_san(response)
+        # Step 2: push LLM move; evaluate post-move (opponent's POV); negate → mover's POV
         board_copy.push(move)
-
-        # Step 3: evaluate post-move position (opponent's POV); negate → mover's POV
         info_post = analyst.analyse(board_copy, chess.engine.Limit(time=0.1))
         opponent_score = info_post["score"].relative.score(mate_score=10000)
         assert opponent_score is not None
         model_score = -opponent_score
 
-        # Step 4: diff, normalise, clamp
+        # Step 3: diff, normalise, clamp
         delta = (model_score - best_score) / 100.0
         return max(-10.0, min(0.0, delta))
 
     except Exception:
-        # Parse failure, engine error, etc. — no double-penalty (R2 already fired)
-        return 0.0
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Combined reward
+# R4 — Optimal bonus
+# ---------------------------------------------------------------------------
+
+def reward_optimal(delta: Optional[float]) -> float:
+    """
+    R4: +1.0 bonus when the move is within 10 centipawns of Stockfish best.
+
+    Args:
+        delta: Value from reward_strategic. None means the move was unparseable.
+
+    Returns:
+        +1.0  delta is not None and delta > -0.1
+         0.0  otherwise (suboptimal or unparseable)
+    """
+    if delta is None:
+        return 0.0
+    return 1.0 if delta > -0.1 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Combined reward — no early exits
 # ---------------------------------------------------------------------------
 
 def compute_reward(
@@ -231,24 +260,22 @@ def compute_reward(
     analyst: chess.engine.SimpleEngine,
 ) -> float:
     """
-    Chain R1 → R2 → R3 with early exit on failure.
+    Evaluate all four reward components unconditionally. Total = R1 + R2 + R3 + R4.
 
-    Early-exit semantics:
-      - Bad format  → return r1          (skip R2, R3)
-      - Illegal     → return r1 + r2     (skip R3)
-      - Legal       → return r1 + r2 + r3
+    R3 returns Optional[float]; None is treated as 0.0 in the sum.
+    R4 receives R3's raw value so it returns 0.0 when R3 is None (no spurious bonus).
 
-    Typical good-move range: [0.1 + 0.5 + (-small)] ≈ [0.5, 0.7]
-    Typical illegal range:   [0.1 + (-5.0)]          = -4.9
-    Bad format:              -1.0
+    Reward ranges:
+      Optimal move, good format   → +0.2 +0.5 +0.0 +1.0 = +1.7
+      Good move −50 cp, good fmt  → +0.2 +0.5 −0.5 +0.0 = +0.2
+      Blunder −300 cp, good fmt   → +0.2 +0.5 −3.0 +0.0 = −2.3
+      Illegal move, good format   → +0.2 −5.0 +0.0 +0.0 = −4.8
+      Bad format, legal move      → −1.0 +0.5 delta bonus varies
+      Bad format, illegal move    → −1.0 −5.0 +0.0 +0.0 = −6.0
     """
     r1 = reward_format(response)
-    if r1 < 0:
-        return r1
-
     r2 = reward_legality(response, board)
-    if r2 < 0:
-        return r1 + r2
-
-    r3 = reward_strategic(response, board, analyst)
-    return r1 + r2 + r3
+    r3_raw = reward_strategic(response, board, analyst)
+    r3 = r3_raw if r3_raw is not None else 0.0
+    r4 = reward_optimal(r3_raw)
+    return r1 + r2 + r3 + r4
