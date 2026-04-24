@@ -68,3 +68,7 @@ inspiration/
 unsloth-docs/
 memory/
 .mcp.json
+.code-review-graph/
+docs/
+AGENTS.md
+CLAUDE.md
