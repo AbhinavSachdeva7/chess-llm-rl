@@ -45,13 +45,16 @@ def collect_game_experience(model, tok, stockfish: StockfishManager,
                             cfg: dict, n_games: int, curriculum: Curriculum):
     """Play n_games greedy vs Stockfish at current curriculum Elo.
 
-    At every LLM turn: snapshot (prompt_str, fen, legal_moves_san) BEFORE the
-    model moves. Returns (HF Dataset, list[GameMetrics], list[str]).
+    At every LLM turn: attempt up to max_retries greedy generations.
+    Completions >= max_completion_length tokens are overlong and discarded.
+    If all retries are overlong the position is dropped (not added to samples)
+    and the game continues with a random legal move.
     """
     from datasets import Dataset
 
     arm = cfg["training"]["arm"]
     max_new = cfg["grpo"]["max_completion_length"]
+    max_retries = cfg["grpo"].get("max_retries", 3)
     samples: list[dict] = []
     per_game_metrics: list[GameMetrics] = []
     per_game_results: list[str] = []
@@ -67,13 +70,27 @@ def collect_game_experience(model, tok, stockfish: StockfishManager,
                 fen = env.board.fen()
                 msgs = env.get_messages()
                 prompt_str = apply_template(tok, msgs)
-                samples.append({
-                    "prompt": prompt_str,
-                    "fen": fen,
-                    "legal_moves_san": legal_san,
-                })
-                raw = _greedy_generate(model, tok, prompt_str, max_new)
-                ok = env.apply_llm_move(raw)
+
+                raw = None
+                for _ in range(max_retries):
+                    candidate = _greedy_generate(model, tok, prompt_str, max_new)
+                    token_count = len(
+                        tok(candidate, add_special_tokens=False)["input_ids"]
+                    )
+                    if token_count < max_new:
+                        raw = candidate
+                        break
+
+                if raw is not None:
+                    samples.append({
+                        "prompt": prompt_str,
+                        "fen": fen,
+                        "legal_moves_san": legal_san,
+                    })
+                    ok = env.apply_llm_move(raw)
+                else:
+                    ok = False
+
                 if not ok:
                     legal = list(env.board.legal_moves)
                     if not legal:
