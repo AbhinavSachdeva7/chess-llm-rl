@@ -4,13 +4,16 @@ model:
   max_seq_length: 4096
 grpo:
   num_generations: 8
-  max_completion_length: 1024
+  max_completion_length: 1024         # GRPO rollout budget (TRL internal generation)
+  max_collection_length: 256          # greedy game-play budget (collect_game_experience only)
   per_device_train_batch_size: 4
   learning_rate: 1.0e-6
   beta: 0.01
   temperature: 1.0
   use_vllm: false                     # no vLLM on T4
   max_retries: 3
+  collection_batch_size: 4            # games generated in parallel per GPU during collection
+  inference_devices: ["cuda:0", "cuda:1"]   # set to ["cuda:0"] for single-GPU; 2nd device gets a replica
 stockfish:
   path: ./stockfish/stockfish
   analyst_time: 0.1
@@ -26,7 +29,7 @@ game:
   pgn_max_tokens: 512
 training:
   arm: fen_pgn                        # or fen_only
-  games_per_iteration: 10
+  games_per_iteration: 8              # must be a multiple of collection_batch_size × inference_devices
   checkpoint_every: 50
   seed: 42
 wandb:

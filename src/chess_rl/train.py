@@ -6,9 +6,11 @@ Verify requires CUDA (Unsloth + bitsandbytes). Runs on Kaggle T4.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -24,85 +26,252 @@ from .stockfish import StockfishManager
 
 
 # ---------------------------------------------------------------------------
-# Experience collection
+# Batched + parallel generation
 # ---------------------------------------------------------------------------
 
-def _greedy_generate(model, tok, prompt_str: str, max_new_tokens: int) -> str:
+def _batch_generate(model, tok, prompts: list[str], max_new_tokens: int) -> list[str]:
+    """Greedy-decode a batch of prompts in one forward pass.
+
+    Left-pads so completions are right-aligned. Returns one decoded string per prompt.
+    """
     import torch
-    ids = tok(text=prompt_str, return_tensors="pt").to(model.device)
-    with torch.inference_mode():
-        out = model.generate(
-            **ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tok.pad_token_id,
-        )
-    new_tokens = out[0][ids["input_ids"].shape[1]:]
-    return tok.decode(new_tokens, skip_special_tokens=True).strip()
+    orig_side = tok.padding_side
+    tok.padding_side = "left"
+    try:
+        inputs = tok(
+            text=prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+        ).to(model.device)
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tok.pad_token_id,
+            )
+        prompt_len = inputs["input_ids"].shape[1]
+        return [
+            tok.decode(out[i][prompt_len:], skip_special_tokens=True).strip()
+            for i in range(len(prompts))
+        ]
+    finally:
+        tok.padding_side = orig_side
 
 
-def collect_game_experience(model, tok, stockfish: StockfishManager,
+# Reusable thread pool: PyTorch releases the GIL during CUDA work, so threads
+# on different devices run genuinely in parallel. No shared mutable state inside
+# _batch_generate, so no locks needed.
+_EXECUTOR: Optional[ThreadPoolExecutor] = None
+
+
+def _get_executor(n_workers: int) -> ThreadPoolExecutor:
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        _EXECUTOR = ThreadPoolExecutor(max_workers=n_workers)
+        atexit.register(lambda: _EXECUTOR.shutdown(wait=False))
+    return _EXECUTOR
+
+
+def _parallel_generate(
+    models: list,
+    tok,
+    prompts_per_model: list[list[str]],
+    max_new_tokens: int,
+) -> list[list[str]]:
+    """Dispatch _batch_generate to each model concurrently. Result order matches input."""
+    if len(models) == 1:
+        return [_batch_generate(models[0], tok, prompts_per_model[0], max_new_tokens)]
+    executor = _get_executor(len(models))
+    active = [(g, m, ps) for g, (m, ps) in enumerate(zip(models, prompts_per_model)) if ps]
+    futures = {g: executor.submit(_batch_generate, m, tok, ps, max_new_tokens)
+               for g, m, ps in active}
+    return [futures[g].result() if g in futures else [] for g in range(len(models))]
+
+
+# ---------------------------------------------------------------------------
+# Inference replica (extra GPUs)
+# ---------------------------------------------------------------------------
+
+def load_inference_replica(primary_model, device: str):
+    """Create an inference-only replica of primary on `device`.
+
+    Saves primary's PEFT adapter to a temp dir, loads a plain HF base + PEFT
+    adapter from it on `device`. Replica is eval-mode and frozen — used only
+    by _batch_generate during collection.
+    """
+    import tempfile
+    import torch
+    from transformers import AutoModelForCausalLM
+    from peft import PeftModel, PeftConfig
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        primary_model.save_pretrained(tmpdir)
+        peft_cfg = PeftConfig.from_pretrained(tmpdir)
+        base = AutoModelForCausalLM.from_pretrained(
+            peft_cfg.base_model_name_or_path,
+            torch_dtype=torch.float16,
+        ).to(device)
+        replica = PeftModel.from_pretrained(base, tmpdir, is_trainable=False).to(device)
+    replica.eval()
+    for p in replica.parameters():
+        p.requires_grad = False
+    return replica
+
+
+def sync_inference_replica(primary, replica) -> None:
+    """Copy primary's LoRA weights into replica in place."""
+    import torch
+    primary_state = primary.state_dict()
+    adapter_state = {k: v for k, v in primary_state.items() if "lora" in k.lower()}
+    if not adapter_state:
+        return
+    replica_device = next(replica.parameters()).device
+    adapter_state = {k: v.to(replica_device) for k, v in adapter_state.items()}
+    replica.load_state_dict(adapter_state, strict=False)
+
+
+def resolve_inference_devices(cfg: dict) -> list[str]:
+    """Return configured inference devices, filtered to those actually available."""
+    import torch
+    devices = cfg.get("grpo", {}).get("inference_devices")
+    if not devices:
+        return ["cuda:0"] if torch.cuda.is_available() else ["cpu"]
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    resolved = []
+    for d in devices:
+        if d == "cpu":
+            resolved.append(d)
+        elif d.startswith("cuda:") and int(d.split(":")[1]) < n_gpus:
+            resolved.append(d)
+    return resolved or (["cuda:0"] if n_gpus > 0 else ["cpu"])
+
+
+# ---------------------------------------------------------------------------
+# Experience collection — parallel games across all inference models
+# ---------------------------------------------------------------------------
+
+def collect_game_experience(models: list, tok, stockfish: StockfishManager,
                             cfg: dict, n_games: int, curriculum: Curriculum):
-    """Play n_games greedy vs Stockfish at current curriculum Elo.
+    """Play n_games in parallel waves across all provided inference models.
 
-    At every LLM turn: attempt up to max_retries greedy generations.
-    Completions >= max_completion_length tokens are overlong and discarded.
-    If all retries are overlong the position is dropped (not added to samples)
-    and the game continues with a random legal move.
+    Each step, every LLM-turn environment is batched with others on the same
+    GPU and generated in one forward pass. If len(models) > 1, the batches
+    run concurrently on different GPUs via a thread pool.
+
+    Overlong responses (>= max_collection_length tokens) are retried up to
+    max_retries times; positions that exhaust all retries are dropped and
+    the game advances with a random legal move.
     """
     from datasets import Dataset
 
-    arm = cfg["training"]["arm"]
-    max_new = cfg["grpo"]["max_completion_length"]
-    max_retries = cfg["grpo"].get("max_retries", 3)
+    grpo = cfg["grpo"]
+    max_new = grpo.get("max_collection_length", grpo["max_completion_length"])
+    max_retries = grpo.get("max_retries", 3)
+    per_gpu_bs = grpo.get("collection_batch_size", 4)
+    n_gpus = len(models)
+    wave_size = per_gpu_bs * n_gpus
+
     samples: list[dict] = []
     per_game_metrics: list[GameMetrics] = []
     per_game_results: list[str] = []
 
     stockfish.set_opponent_elo(curriculum.elo)
 
-    for _ in range(n_games):
-        env = ChessEnvironment(cfg, stockfish, tokenizer=tok)
-        env.reset()
-        while not env.is_game_over():
-            if env.is_llm_turn():
-                legal_san = sorted(env.board.san(m) for m in env.board.legal_moves)
-                fen = env.board.fen()
-                msgs = env.get_messages()
-                prompt_str = apply_template(tok, msgs)
+    remaining = n_games
+    while remaining > 0:
+        wave_count = min(wave_size, remaining)
+        envs = [ChessEnvironment(cfg, stockfish, tokenizer=tok) for _ in range(wave_count)]
+        for env in envs:
+            env.reset()
+        retry_counts = [0] * wave_count
+        pending_meta: list[Optional[dict]] = [None] * wave_count
 
-                raw = None
-                for _ in range(max_retries):
-                    candidate = _greedy_generate(model, tok, prompt_str, max_new)
-                    token_count = len(
-                        tok(candidate, add_special_tokens=False)["input_ids"]
-                    )
-                    if token_count < max_new:
-                        raw = candidate
-                        break
+        while any(not env.is_game_over() for env in envs):
+            # 1) Advance every env currently on Stockfish's turn.
+            for env in envs:
+                if not env.is_game_over() and not env.is_llm_turn():
+                    env.apply_stockfish_move()
 
-                if raw is not None:
-                    samples.append({
-                        "prompt": prompt_str,
-                        "fen": fen,
-                        "legal_moves_san": legal_san,
-                    })
-                    ok = env.apply_llm_move(raw)
-                else:
-                    ok = False
+            # 2) Gather envs that now need an LLM move.
+            llm_idx = [
+                i for i, env in enumerate(envs)
+                if not env.is_game_over() and env.is_llm_turn()
+            ]
+            if not llm_idx:
+                continue
 
-                if not ok:
-                    legal = list(env.board.legal_moves)
-                    if not legal:
-                        break
-                    mv = random.choice(legal)
-                    env.pgn_san.append(env.board.san(mv))
-                    env.board.push(mv)
-                    env.metrics.no_legal_fallback += 1
-            else:
-                env.apply_stockfish_move()
-        per_game_metrics.append(env.metrics)
-        per_game_results.append(env.get_result())
+            # 3) Build / reuse prompts (pending retries keep their prompt).
+            prompts_flat: list[str] = []
+            metas: list[dict] = []
+            for i in llm_idx:
+                if pending_meta[i] is None:
+                    legal_san = sorted(envs[i].board.san(mv) for mv in envs[i].board.legal_moves)
+                    fen = envs[i].board.fen()
+                    msgs = envs[i].get_messages()
+                    prompt_str = apply_template(tok, msgs)
+                    pending_meta[i] = {
+                        "idx": i, "fen": fen,
+                        "legal_san": legal_san, "prompt_str": prompt_str,
+                    }
+                    retry_counts[i] = 0
+                m = pending_meta[i]
+                prompts_flat.append(m["prompt_str"])
+                metas.append(m)
+
+            # 4) Round-robin split across GPUs → keeps per-GPU batch sizes balanced.
+            prompts_per_gpu: list[list[str]] = [[] for _ in range(n_gpus)]
+            metas_per_gpu: list[list[dict]] = [[] for _ in range(n_gpus)]
+            for j, (p, m) in enumerate(zip(prompts_flat, metas)):
+                g = j % n_gpus
+                prompts_per_gpu[g].append(p)
+                metas_per_gpu[g].append(m)
+
+            # 5) Parallel generate: each GPU runs its own batch; threads release
+            # the GIL during CUDA work so both GPUs compute concurrently.
+            responses_per_gpu = _parallel_generate(models, tok, prompts_per_gpu, max_new)
+
+            # 6) Route responses back to envs; handle retries and fallbacks.
+            for g_responses, g_metas in zip(responses_per_gpu, metas_per_gpu):
+                for resp, meta in zip(g_responses, g_metas):
+                    i = meta["idx"]
+                    token_count = len(tok(resp, add_special_tokens=False)["input_ids"])
+                    if token_count >= max_new:
+                        retry_counts[i] += 1
+                        if retry_counts[i] < max_retries:
+                            continue  # keep pending_meta, retry next loop iter
+                        raw = None
+                    else:
+                        raw = resp
+
+                    pending_meta[i] = None
+                    retry_counts[i] = 0
+                    env = envs[i]
+
+                    if raw is not None:
+                        samples.append({
+                            "prompt": meta["prompt_str"],
+                            "fen": meta["fen"],
+                            "legal_moves_san": meta["legal_san"],
+                        })
+                        ok = env.apply_llm_move(raw)
+                    else:
+                        ok = False
+
+                    if not ok:
+                        legal = list(env.board.legal_moves)
+                        if not legal:
+                            env.board.clear()  # force game-over
+                        else:
+                            mv = random.choice(legal)
+                            env.pgn_san.append(env.board.san(mv))
+                            env.board.push(mv)
+                            env.metrics.no_legal_fallback += 1
+
+        per_game_metrics.extend(env.metrics for env in envs)
+        per_game_results.extend(env.get_result() for env in envs)
+        remaining -= wave_count
 
     return Dataset.from_list(samples), per_game_metrics, per_game_results
 
@@ -198,12 +367,12 @@ def _log_games(wb, metrics_list, results, curriculum: Curriculum, games_seen: in
 # Training iteration
 # ---------------------------------------------------------------------------
 
-def train_iteration(model, tok, stockfish, cfg, curriculum, state, wb):
+def train_iteration(model, tok, stockfish, cfg, curriculum, state, wb, inference_models):
     from trl import GRPOConfig, GRPOTrainer
 
     n_games = cfg["training"]["games_per_iteration"]
     dataset, metrics_list, results = collect_game_experience(
-        model, tok, stockfish, cfg, n_games, curriculum,
+        inference_models, tok, stockfish, cfg, n_games, curriculum,
     )
     state["games_seen"] += n_games
     for r in results:
@@ -246,6 +415,11 @@ def train_iteration(model, tok, stockfish, cfg, curriculum, state, wb):
         train_dataset=dataset,
     )
     trainer.train()
+
+    # Sync updated LoRA weights to each replica so the next collection wave
+    # generates from the post-training model.
+    for replica in inference_models[1:]:
+        sync_inference_replica(model, replica)
 
     ckpt_every = cfg["training"]["checkpoint_every"]
     if state["games_seen"] // ckpt_every > state.get("last_ckpt_bucket", -1):
@@ -309,6 +483,14 @@ def main(config_path: str, resume_from: Optional[str] = None) -> None:
 
     stockfish = StockfishManager()
 
+    # Build inference model list: primary + replicas on extra devices.
+    devices = resolve_inference_devices(cfg)
+    inference_models = [model]
+    for d in devices[1:]:
+        print(f"[inference] loading replica on {d}")
+        inference_models.append(load_inference_replica(model, d))
+    print(f"[inference] active devices: {devices}")
+
     prior = _load_resume(resume_from) or {}
     curriculum = Curriculum(
         start_elo=prior.get("elo", cfg["curriculum"]["start_elo"]),
@@ -330,7 +512,7 @@ def main(config_path: str, resume_from: Optional[str] = None) -> None:
     target_games = int(os.environ.get("TARGET_GAMES", "180"))
     try:
         while state["games_seen"] < target_games:
-            train_iteration(model, tok, stockfish, cfg, curriculum, state, wb)
+            train_iteration(model, tok, stockfish, cfg, curriculum, state, wb, inference_models)
     finally:
         save_checkpoint(model, tok, cfg, {
             "games_seen": state["games_seen"],
