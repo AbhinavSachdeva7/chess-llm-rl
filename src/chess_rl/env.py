@@ -29,11 +29,13 @@ class ChessEnvironment:
         self.metrics: GameMetrics = GameMetrics()
         self.arm: str = config.get("training", {}).get("arm", "fen_pgn")
         self.max_moves: int = config.get("game", {}).get("max_moves", 200)
+        self._force_quit: bool = False
 
     def reset(self, llm_color: Optional[bool] = None) -> None:
         self.board = chess.Board()
         self.pgn_san = []
         self.metrics = GameMetrics()
+        self._force_quit = False
         if llm_color is None:
             self.llm_color = random.choice([chess.WHITE, chess.BLACK])
         else:
@@ -77,11 +79,20 @@ class ChessEnvironment:
 
     def is_game_over(self) -> bool:
         return (
-            self.board.is_game_over(claim_draw=True)
+            self._force_quit
+            or self.board.is_game_over(claim_draw=True)
             or len(self.pgn_san) >= self.max_moves
         )
 
     def get_result(self) -> Literal["win", "loss", "draw"]:
+        if self._force_quit:
+            # If we forced a quit, it's typically because we had no legal moves
+            # left (checkmate) or an error occurred.
+            outcome = self.board.outcome(claim_draw=True)
+            if outcome and outcome.winner is not None:
+                return "win" if outcome.winner == self.llm_color else "loss"
+            return "draw"
+
         outcome = self.board.outcome(claim_draw=True)
         if outcome is None:
             return "draw"  # max-move cap

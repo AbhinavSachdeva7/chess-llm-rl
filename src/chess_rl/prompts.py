@@ -97,5 +97,5 @@ def apply_template(tok, messages: list[dict]) -> str:
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=True,
+        enable_thinking=False,
     )

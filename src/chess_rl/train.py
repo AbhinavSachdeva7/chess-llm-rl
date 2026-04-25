@@ -35,15 +35,18 @@ def _batch_generate(model, tok, prompts: list[str], max_new_tokens: int) -> list
     Left-pads so completions are right-aligned. Returns one decoded string per prompt.
     """
     import torch
-    orig_side = tok.padding_side
-    tok.padding_side = "left"
+    # We pass padding_side="left" directly to the tokenizer to avoid shared-state
+    # races on the tok object (which is shared across threads).
+    # Note: we use tok.tokenizer instead of tok() to bypass multimodal processing
+    # which can sometimes return extra keys that .to(device) doesn't like.
+    inputs = tok.tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=False,
+        padding_side="left",
+    ).to(model.device)
     try:
-        inputs = tok(
-            text=prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-        ).to(model.device)
         with torch.inference_mode():
             out = model.generate(
                 **inputs,
@@ -57,12 +60,11 @@ def _batch_generate(model, tok, prompts: list[str], max_new_tokens: int) -> list
             for i in range(len(prompts))
         ]
     finally:
-        tok.padding_side = orig_side
+        pass
 
 
 # Reusable thread pool: PyTorch releases the GIL during CUDA work, so threads
-# on different devices run genuinely in parallel. No shared mutable state inside
-# _batch_generate, so no locks needed.
+# on different devices run genuinely in parallel.
 _EXECUTOR: Optional[ThreadPoolExecutor] = None
 
 
@@ -74,6 +76,10 @@ def _get_executor(n_workers: int) -> ThreadPoolExecutor:
     return _EXECUTOR
 
 
+_WARMED_UP = False
+_USE_SEQUENTIAL = False
+
+
 def _parallel_generate(
     models: list,
     tok,
@@ -81,42 +87,94 @@ def _parallel_generate(
     max_new_tokens: int,
 ) -> list[list[str]]:
     """Dispatch _batch_generate to each model concurrently. Result order matches input."""
+    import torch
+    global _WARMED_UP, _USE_SEQUENTIAL
+
     if len(models) == 1:
         return [_batch_generate(models[0], tok, prompts_per_model[0], max_new_tokens)]
+
+    if _USE_SEQUENTIAL:
+        return [_batch_generate(m, tok, ps, max_new_tokens)
+                for m, ps in zip(models, prompts_per_model)]
+
+    # 1. Sequential warm-up on first call to stabilize Unsloth kernels
+    if not _WARMED_UP:
+        try:
+            for m in models:
+                dev = next(m.parameters()).device
+                _batch_generate(m, tok, ["Warmup"], 1)
+                torch.cuda.synchronize(dev)
+            _WARMED_UP = True
+        except RuntimeError as e:
+            # If warmup itself fails due to Dynamo/FX, trigger sticky fallback immediately
+            if "FX" in str(e) or "dynamo" in str(e).lower():
+                print(f"[inference] sticky sequential fallback triggered during warmup by: {e}")
+                _USE_SEQUENTIAL = True
+                _WARMED_UP = True
+            else:
+                raise e
+
+    if _USE_SEQUENTIAL:
+        return [_batch_generate(m, tok, ps, max_new_tokens)
+                for m, ps in zip(models, prompts_per_model)]
+
+    # 2. Attempt parallel execution via thread pool
     executor = _get_executor(len(models))
     active = [(g, m, ps) for g, (m, ps) in enumerate(zip(models, prompts_per_model)) if ps]
-    futures = {g: executor.submit(_batch_generate, m, tok, ps, max_new_tokens)
-               for g, m, ps in active}
-    return [futures[g].result() if g in futures else [] for g in range(len(models))]
+    
+    try:
+        futures = {g: executor.submit(_batch_generate, m, tok, ps, max_new_tokens)
+                   for g, m, ps in active}
+        return [futures[g].result() if g in futures else [] for g in range(len(models))]
+    except RuntimeError as e:
+        # Fallback to sequential generation if Dynamo/FX collisions occur
+        if "FX" in str(e) or "dynamo" in str(e).lower():
+            print(f"[inference] sticky sequential fallback triggered by: {e}")
+            _USE_SEQUENTIAL = True
+            return [_batch_generate(m, tok, ps, max_new_tokens)
+                    for m, ps in zip(models, prompts_per_model)]
+        raise e
 
 
 # ---------------------------------------------------------------------------
 # Inference replica (extra GPUs)
 # ---------------------------------------------------------------------------
 
-def load_inference_replica(primary_model, device: str):
+def load_inference_replica(primary_model, device: str, max_seq_length: int):
     """Create an inference-only replica of primary on `device`.
 
-    Saves primary's PEFT adapter to a temp dir, loads a plain HF base + PEFT
-    adapter from it on `device`. Replica is eval-mode and frozen — used only
-    by _batch_generate during collection.
+    Uses FastModel.from_pretrained for the base model then loads the adapter
+    separately. This ensures Unsloth kernels match the primary model's 4-bit state.
     """
     import tempfile
     import torch
-    from transformers import AutoModelForCausalLM
+    from unsloth import FastModel
     from peft import PeftModel, PeftConfig
 
     with tempfile.TemporaryDirectory() as tmpdir:
         primary_model.save_pretrained(tmpdir)
         peft_cfg = PeftConfig.from_pretrained(tmpdir)
-        base = AutoModelForCausalLM.from_pretrained(
-            peft_cfg.base_model_name_or_path,
-            torch_dtype=torch.float16,
-        ).to(device)
-        replica = PeftModel.from_pretrained(base, tmpdir, is_trainable=False).to(device)
-    replica.eval()
-    for p in replica.parameters():
-        p.requires_grad = False
+
+        with torch.cuda.device(device):
+            base, _ = FastModel.from_pretrained(
+                model_name=peft_cfg.base_model_name_or_path,
+                dtype=None,
+                max_seq_length=max_seq_length,
+                load_in_4bit=True,
+                device_map={"": device},  # Force placement on target GPU
+            )
+            # Load the adapter and optimize for inference within the same device context
+            replica = PeftModel.from_pretrained(base, tmpdir, is_trainable=False)
+            FastModel.for_inference(replica)
+
+    # Verification: Ensure it actually landed on the requested device
+    actual = str(next(replica.parameters()).device)
+    assert actual == device, f"replica on {actual}, expected {device}"
+
+    # Verify LoRA weights are still present (for_inference should NOT merge them)
+    has_lora = any("lora" in k.lower() for k in replica.state_dict())
+    assert has_lora, "replica adapter appears merged; sync_inference_replica will be a no-op"
+
     return replica
 
 
@@ -236,7 +294,7 @@ def collect_game_experience(models: list, tok, stockfish: StockfishManager,
             for g_responses, g_metas in zip(responses_per_gpu, metas_per_gpu):
                 for resp, meta in zip(g_responses, g_metas):
                     i = meta["idx"]
-                    token_count = len(tok(resp, add_special_tokens=False)["input_ids"])
+                    token_count = len(tok.tokenizer(resp, add_special_tokens=False)["input_ids"])
                     if token_count >= max_new:
                         retry_counts[i] += 1
                         if retry_counts[i] < max_retries:
@@ -262,13 +320,15 @@ def collect_game_experience(models: list, tok, stockfish: StockfishManager,
                     if not ok:
                         legal = list(env.board.legal_moves)
                         if not legal:
-                            env.board.clear()  # force game-over
+                            env._force_quit = True
                         else:
                             mv = random.choice(legal)
                             env.pgn_san.append(env.board.san(mv))
                             env.board.push(mv)
                             env.metrics.no_legal_fallback += 1
 
+        finished = n_games - remaining + wave_count
+        print(f"[wave] finished {finished}/{n_games} games")
         per_game_metrics.extend(env.metrics for env in envs)
         per_game_results.extend(env.get_result() for env in envs)
         remaining -= wave_count
@@ -488,7 +548,9 @@ def main(config_path: str, resume_from: Optional[str] = None) -> None:
     inference_models = [model]
     for d in devices[1:]:
         print(f"[inference] loading replica on {d}")
-        inference_models.append(load_inference_replica(model, d))
+        inference_models.append(load_inference_replica(
+            model, d, cfg["model"]["max_seq_length"]
+        ))
     print(f"[inference] active devices: {devices}")
 
     prior = _load_resume(resume_from) or {}
