@@ -176,18 +176,36 @@ def make_chess_reward_func():
 
 
 # ---------------------------------------------------------------------------
-# Checkpointing & Training
+# Checkpointing
 # ---------------------------------------------------------------------------
 
+def _checkpoint_dir(base: str, games_seen: int) -> Path:
+    p = Path(base) / f"ckpt_games_{games_seen:06d}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 def save_checkpoint(model, tok, cfg: dict, state: dict, games_seen: int) -> Path:
-    path = Path(cfg["paths"]["checkpoints"]) / f"ckpt_games_{games_seen:06d}"
-    path.mkdir(parents=True, exist_ok=True)
+    path = _checkpoint_dir(cfg["paths"]["checkpoints"], games_seen)
     model.save_pretrained(str(path))
     tok.save_pretrained(str(path))
     with open(path / "state.json", "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
     return path
 
+def _load_resume(resume_from: Optional[str]):
+    if not resume_from:
+        return None
+    p = Path(resume_from)
+    sj = p / "state.json"
+    if not sj.exists():
+        return None
+    with open(sj, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
 def train_iteration(model, tok, stockfish, cfg, curriculum, state, wb):
     from trl import GRPOConfig, GRPOTrainer
@@ -208,6 +226,7 @@ def train_iteration(model, tok, stockfish, cfg, curriculum, state, wb):
                 "result": {"win": 1, "draw": 0, "loss": -1}[r],
                 "legality": m.legal / total,
                 "current_elo": curriculum.elo,
+                "win_rate_30": curriculum.win_rate(),
                 "games_seen": state["games_seen"],
             })
 
@@ -241,9 +260,15 @@ def train_iteration(model, tok, stockfish, cfg, curriculum, state, wb):
     )
     trainer.train()
 
-    if state["games_seen"] // cfg["training"]["checkpoint_every"] > state.get("last_ckpt", -1):
-        state["last_ckpt"] = state["games_seen"] // cfg["training"]["checkpoint_every"]
-        save_checkpoint(model, tok, cfg, state, state["games_seen"])
+    ckpt_every = cfg["training"]["checkpoint_every"]
+    if state["games_seen"] // ckpt_every > state.get("last_ckpt_bucket", -1):
+        state["last_ckpt_bucket"] = state["games_seen"] // ckpt_every
+        save_checkpoint(model, tok, cfg, {
+            "games_seen": state["games_seen"],
+            "elo": curriculum.elo,
+            "window": list(curriculum._results),
+            "wandb_run_id": state.get("wandb_run_id"),
+        }, state["games_seen"])
 
 
 def main(config_path: str, resume_from: Optional[str] = None) -> None:
@@ -255,30 +280,48 @@ def main(config_path: str, resume_from: Optional[str] = None) -> None:
     from .model import load_model
     model, tok = load_model(cfg["model"]["name"], cfg["model"]["max_seq_length"])
 
+    prior = _load_resume(resume_from) or {}
     if resume_from:
         model.load_adapter(resume_from, adapter_name="default")
 
     stockfish = StockfishManager()
     
     curriculum = Curriculum(
-        start_elo=cfg["curriculum"]["start_elo"],
+        start_elo=prior.get("elo", cfg["curriculum"]["start_elo"]),
         step=cfg["curriculum"]["step"],
         win_rate_threshold=cfg["curriculum"]["win_rate_threshold"],
         min_games_at_level=cfg["curriculum"]["min_games_at_level"],
         window=cfg["curriculum"]["window"],
     )
+    for r in prior.get("window", []):
+        curriculum.record(r)
 
-    state = {"games_seen": 0}
+    state = {
+        "games_seen": prior.get("games_seen", 0),
+        "wandb_run_id": prior.get("wandb_run_id"),
+        "last_ckpt_bucket": prior.get("games_seen", 0) // cfg["training"]["checkpoint_every"],
+    }
     
     import wandb
-    wb = wandb.init(project=cfg["wandb"]["project"], config=cfg)
+    wb = wandb.init(
+        project=cfg["wandb"].get("project", "chess-llm-rl"),
+        id=state.get("wandb_run_id"),
+        resume="allow" if state.get("wandb_run_id") else None,
+        config=cfg
+    )
+    state["wandb_run_id"] = wb.id
 
     target_games = int(os.environ.get("TARGET_GAMES", "180"))
     try:
         while state["games_seen"] < target_games:
             train_iteration(model, tok, stockfish, cfg, curriculum, state, wb)
     finally:
-        save_checkpoint(model, tok, cfg, state, state["games_seen"])
+        save_checkpoint(model, tok, cfg, {
+            "games_seen": state["games_seen"],
+            "elo": curriculum.elo,
+            "window": list(curriculum._results),
+            "wandb_run_id": state.get("wandb_run_id"),
+        }, state["games_seen"])
         stockfish.close()
         wb.finish()
 
