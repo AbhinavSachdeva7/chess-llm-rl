@@ -97,22 +97,31 @@ def _parallel_generate(
         return [_batch_generate(m, tok, ps, max_new_tokens)
                 for m, ps in zip(models, prompts_per_model)]
 
-    # 1. Sequential warm-up on first call to stabilize Unsloth kernels
+    # 1. Sequential warm-up on first call to stabilize Unsloth kernels.
+    # We process the VERY FIRST turn of the session sequentially. This ensures that
+    # all Dynamo/FX compilation (which is not thread-safe) happens one-by-one.
     if not _WARMED_UP:
-        try:
-            for m in models:
-                dev = next(m.parameters()).device
-                _batch_generate(m, tok, ["Warmup"], 1)
-                torch.cuda.synchronize(dev)
-            _WARMED_UP = True
-        except RuntimeError as e:
-            # If warmup itself fails due to Dynamo/FX, trigger sticky fallback immediately
-            if "FX" in str(e) or "dynamo" in str(e).lower():
-                print(f"[inference] sticky sequential fallback triggered during warmup by: {e}")
-                _USE_SEQUENTIAL = True
+        active_indices = [i for i, ps in enumerate(prompts_per_model) if ps]
+        if active_indices:
+            print(f"[inference] first-turn sequential warmup for {len(active_indices)} devices...")
+            results = [[] for _ in range(len(models))]
+            try:
+                for i in range(len(models)):
+                    if prompts_per_model[i]:
+                        results[i] = _batch_generate(models[i], tok, prompts_per_model[i], max_new_tokens)
+                        torch.cuda.synchronize()
+                        print(f"  - device {i} warmed up (batch size {len(prompts_per_model[i])})")
                 _WARMED_UP = True
-            else:
-                raise e
+                print("[inference] warmup complete; parallel dispatch enabled")
+                return results
+            except RuntimeError as e:
+                if "FX" in str(e) or "dynamo" in str(e).lower():
+                    print(f"[inference] sticky sequential fallback triggered during warmup by: {e}")
+                    _USE_SEQUENTIAL = True
+                    _WARMED_UP = True
+                    # Fall through to sequential logic below
+                else:
+                    raise e
 
     if _USE_SEQUENTIAL:
         return [_batch_generate(m, tok, ps, max_new_tokens)
