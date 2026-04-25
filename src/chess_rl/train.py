@@ -282,7 +282,13 @@ def main(config_path: str, resume_from: Optional[str] = None) -> None:
 
     prior = _load_resume(resume_from) or {}
     if resume_from:
-        model.load_adapter(resume_from, adapter_name="default")
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file as _load_safetensors
+        adapter_path = Path(resume_from) / "adapter_model.safetensors"
+        if not adapter_path.exists():
+            raise FileNotFoundError(f"adapter_model.safetensors not found in {resume_from}")
+        sd = _load_safetensors(str(adapter_path))
+        set_peft_model_state_dict(model, sd)
 
     stockfish = StockfishManager()
     
