@@ -51,8 +51,10 @@ wandb/
 *.ckpt
 
 # Stockfish binaries
-stockfish*
 /stockfish/
+stockfish.exe
+stockfish-*.tar
+stockfish-*.zip
 
 # Jupyter
 .ipynb_checkpoints/
